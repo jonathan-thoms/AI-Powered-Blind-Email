@@ -3,10 +3,22 @@ import email
 import re
 import speech_recognition as sr
 import pyttsx3
+import os
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
-from transformers import pipeline  # For summarization
+from transformers import pipeline
+import torch
 import numpy as np
+from PIL import Image
+import requests
+from io import BytesIO
+from transformers import BlipProcessor, BlipForConditionalGeneration
+
+
+# Configure Hugging Face cache
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+cache_dir = os.path.join(os.getcwd(), "huggingface_cache")
+os.makedirs(cache_dir, exist_ok=True)
 
 
 class VoiceEmailManager:
@@ -14,7 +26,14 @@ class VoiceEmailManager:
         # Email Credentials
         self.EMAIL_USER = "emailtest.jonathan@gmail.com"
         self.EMAIL_PASS = "xwis udwz bwgr ueuh"
-
+        # Initialize summarizer (add this inside __init__)
+        self.summarizer = pipeline(
+            "summarization",
+            model = "sshleifer/distilbart-cnn-12-6",  # Powerful but slower
+            device=-1,  # Use CPU
+            min_length=30,
+            max_length=100
+        )
         # Voice Engine
         self.engine = pyttsx3.init()
         self.engine.setProperty("rate", 150)
@@ -23,36 +42,48 @@ class VoiceEmailManager:
         # Spam Filter Model (Naive Bayes)
         self.vectorizer = TfidfVectorizer()
         self.spam_model = MultinomialNB()
-        self._train_dummy_spam_model()  # Initialize with dummy data
+        self._train_dummy_spam_model()
 
-        # Summarization Model (BART)
-        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        # Initialize image processor with fast tokenizer
+        self.image_processor = BlipProcessor.from_pretrained(
+            "Salesforce/blip-image-captioning-base",
+            use_fast=True  # Force fast tokenizer
+        )
+        self.image_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base"
+        )
+
 
         # Priority Detection Rules
         self.priority_senders = ["important@domain.com", "boss@company.com"]
         self.priority_keywords = ["urgent", "meeting", "deadline"]
 
-        # Number Mapping
-        self.number_words = {
-            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
-        }
+        # Current state
+        self.current_emails = {}
 
-    # --- Core Functions (Existing Code) ---
+    # --- Core Functions ---
     def speak(self, text):
+        print(f"ASSISTANT: {text}")
         self.engine.say(text)
         self.engine.runAndWait()
 
-    def listen_command(self):
-        with sr.Microphone() as source:
-            self.speak("Listening...")
-            self.recognizer.adjust_for_ambient_noise(source)
-            try:
-                audio = self.recognizer.listen(source, timeout=5)
-                return self.recognizer.recognize_google(audio).lower()
-            except (sr.UnknownValueError, sr.RequestError):
-                self.speak("Sorry, I couldn't understand. Try again.")
-                return None
+    def listen_command(self, max_retries=3):
+        for attempt in range(max_retries):
+            with sr.Microphone() as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+                self.speak("Listening..." if attempt == 0 else "Try again...")
+                try:
+                    audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=8)
+                    command = self.recognizer.recognize_google(audio).lower()
+                    print(f"USER SAID: {command}")
+                    return command
+                except sr.WaitTimeoutError:
+                    self.speak("I didn't hear anything.")
+                except sr.UnknownValueError:
+                    self.speak("Sorry, I didn't understand that.")
+                except sr.RequestError:
+                    self.speak("Speech service error.")
+        return input("Type your command: ").lower()
 
     def fetch_emails(self, folder="inbox", unseen=True):
         try:
@@ -74,124 +105,292 @@ class VoiceEmailManager:
             return email_list
         except Exception as e:
             self.speak("Error fetching emails.")
-            print(str(e))
+            print(f"ERROR: {str(e)}")
             return {}
 
-    # --- New Features to Add ---
-    # Feature 1: Spam Detection (Naive Bayes)
+    # --- Email Processing ---
+    def _describe_image(self, image_data):
+        """Robust image description with error handling"""
+        try:
+            img = Image.open(BytesIO(image_data))
+
+            # Convert to RGB if needed (for PNGs with transparency)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            inputs = self.image_processor(img, return_tensors="pt")
+            out = self.image_model.generate(**inputs, max_new_tokens=50)
+            return self.image_processor.decode(out[0], skip_special_tokens=True)
+        except Exception as e:
+            print(f"Image processing failed: {e}")
+            return None
+
+    def _get_email_body(self, msg, include_image_descriptions=False):
+        """
+        Enhanced version that maintains original functionality
+        but can optionally describe images
+        """
+        text_body = ""
+        image_descriptions = []
+
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    # Get text content (original functionality)
+                    if part.get_content_type() == "text/plain":
+                        text_body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+
+                    # New: Analyze images if requested
+                    if include_image_descriptions and part.get_content_maintype() == 'image':
+                        img_data = part.get_payload(decode=True)
+                        description = self._describe_image(img_data)
+                        if description:
+                            image_descriptions.append(description)
+
+            else:  # Non-multipart email
+                text_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+
+        except Exception as e:
+            print(f"Email parsing error: {e}")
+            text_body = "Could not read email body"
+
+        # Maintain backward compatibility
+        if include_image_descriptions:
+            return text_body, image_descriptions
+        return text_body
+
+    def _get_email_images(self, msg):
+        """Extract all images from email"""
+        images = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_maintype() == 'image':
+                    try:
+                        img_data = part.get_payload(decode=True)
+                        images.append(img_data)
+                    except Exception as e:
+                        print(f"Failed to extract image: {e}")
+        return images
+
+    def read_email_with_images(self, email_list, selected_index):
+        """Enhanced email reader with image descriptions"""
+        if selected_index not in email_list:
+            self.speak("Invalid selection")
+            return
+
+        _, msg = email_list[selected_index]
+
+        # Get text body (original functionality)
+        text_body = self._get_email_body(msg)
+
+        # Process images
+        image_descriptions = []
+        for img_data in self._get_email_images(msg):
+            desc = self._describe_image(img_data)
+            if desc:
+                image_descriptions.append(desc)
+
+        # Build output
+        if image_descriptions:
+            self.speak("Found images:")
+            for i, desc in enumerate(image_descriptions, 1):
+                self.speak(f"Image {i}: {desc}")
+
+        self.speak("Email content: " + text_body[:300])
+
+    def extract_number(self, command):
+        """Improved number extraction from voice commands"""
+        # Check for digits ("open 3")
+        num_match = re.search(r'\b(\d+)\b', command)
+        if num_match:
+            return int(num_match.group(1))
+
+        # Check for number words ("open three")
+        number_words = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+            'first': 1, 'second': 2, 'third': 3, 'last': len(self.current_emails)
+        }
+        for word, num in number_words.items():
+            if word in command.lower():
+                return num
+        return None
+
+    # --- Features ---
     def _train_dummy_spam_model(self):
-        # Replace with real training data later
-        X_train = ["win free money", "meeting at 3pm", "urgent project update"]
-        y_train = [1, 0, 0]  # 1=spam, 0=ham
+        X_train = ["win free money", "meeting at 3pm", "urgent update"]
+        y_train = [1, 0, 0]  # 1=spam
         X_vec = self.vectorizer.fit_transform(X_train)
         self.spam_model.fit(X_vec, y_train)
 
     def is_spam(self, email_text):
-        X_vec = self.vectorizer.transform([email_text])
-        return self.spam_model.predict(X_vec)[0] == 1
+        try:
+            X_vec = self.vectorizer.transform([email_text])
+            return self.spam_model.predict(X_vec)[0] == 1
+        except:
+            return False
 
-    # Feature 2: Priority Detection
     def is_priority(self, email_msg):
-        subject = email_msg["subject"] or ""
-        sender = email_msg["from"] or ""
+        subject = email_msg.get("subject", "").lower()
+        sender = email_msg.get("from", "").lower()
+        body = self._get_email_body(email_msg).lower()
 
-        # Rule 1: Sender is in priority list
-        if any(priority_sender in sender for priority_sender in self.priority_senders):
-            return True
+        return (any(s in sender for s in self.priority_senders) or
+                any(k in subject or k in body for k in self.priority_keywords))
 
-        # Rule 2: Keywords in subject/body
-        body = self._get_email_body(email_msg)
-        if any(keyword in subject.lower() or keyword in body.lower()
-               for keyword in self.priority_keywords):
-            return True
+    def _chunk_text(self, text, chunk_size=1024):
+        """Split long emails into manageable chunks"""
+        words = text.split()
+        for i in range(0, len(words), chunk_size):
+            yield ' '.join(words[i:i + chunk_size])
 
-        return False
+    def summarize_email(self, email_msg):
+        """Analyzes entire email and provides concise summary"""
+        full_body = self._get_email_body(email_msg)
 
-    # Feature 3: Summarization
-    def summarize_email(self, email_msg, max_length=150):
-        body = self._get_email_body(email_msg)
-        summary = self.summarizer(body, max_length=max_length, min_length=30, do_sample=False)
-        return summary[0]["summary_text"]
+        # Skip very short emails
+        if len(full_body.split()) < 25:
+            return "Brief email: " + full_body[:150] + ("..." if len(full_body) > 150 else "")
 
-    # Feature 4: Voice-Activated Search
-    def search_emails(self, query, folder="inbox"):
-        emails = self.fetch_emails(folder, unseen=False)
-        results = []
-        for idx, (email_id, msg) in emails.items():
-            body = self._get_email_body(msg)
-            if query.lower() in body.lower() or query.lower() in msg["subject"].lower():
-                results.append((idx, msg))
-        return results
+        try:
+            # Process in chunks if needed (for long emails)
+            if len(full_body) > 1024:
+                chunks = list(self._chunk_text(full_body))
+                summaries = []
+                for chunk in chunks:
+                    summary = self.summarizer(chunk, max_length=75, min_length=25)[0]["summary_text"]
+                    summaries.append(summary)
+                full_summary = ' '.join(summaries)
+                # Summarize the summaries if too long
+                if len(full_summary.split()) > 50:
+                    full_summary = self.summarizer(full_summary, max_length=100, min_length=30)[0]["summary_text"]
+            else:
+                full_summary = self.summarizer(full_body)[0]["summary_text"]
 
-    # --- Helper Functions ---
-    def _get_email_body(self, msg):
+            # Clean up and ensure proper sentence structure
+            full_summary = full_summary.replace(" .", ".").replace(" ,", ",")
+            full_summary = re.sub(r'\s+', ' ', full_summary).strip()
+            return full_summary
+
+        except Exception as e:
+            print(f"Summarization error: {e}")
+            # Fallback to key sentences
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', full_body) if s.strip()]
+            if len(sentences) >= 3:
+                return f"Main points: {sentences[0]} {sentences[len(sentences) // 2]} {sentences[-1]}"
+            return sentences[0] if sentences else "Could not generate summary"
+
+    # --- Main Workflows ---
+    def _handle_email_checking(self):
+        self.current_emails = self.fetch_emails()
+        if not self.current_emails:
+            self.speak("No new emails found.")
+            return
+
+        for idx, (email_id, msg) in self.current_emails.items():
+            flags = []
+            if self.is_priority(msg):
+                flags.append("Priority")
+            if self.is_spam(f"{msg['subject']} {self._get_email_body(msg)}"):
+                flags.append("Spam")
+
+            status = f" ({' | '.join(flags)})" if flags else ""
+            self.speak(f"Email {idx}: From {msg['from']}. Subject: {msg['subject']}{status}")
+
+        self.speak("Say 'open X' to read, 'describe X' for images, or 'summarize X' for a summary.")
+        while True:
+            cmd = self.listen_command()
+            if not cmd:
+                continue
+
+            if "back" in cmd.lower():
+                break
+
+            num = self.extract_number(cmd)
+            if num in self.current_emails:
+                if "summarise" in cmd.lower() or "summarize" in cmd.lower():
+                    summary = self.summarize_email(self.current_emails[num][1])
+                    self.speak(f"Summary: {summary}")
+                elif "describe" in cmd.lower():
+                    self._describe_email_images(self.current_emails[num][1])
+                else:
+                    self.speak(self._get_email_body(self.current_emails[num][1]))
+            else:
+                self.speak("Invalid selection. Try again.")
+
+    def _describe_email_images(self, msg):
+        """Describe all images in an email"""
+        image_descriptions = []
         if msg.is_multipart():
             for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    return part.get_payload(decode=True).decode("utf-8")
+                if part.get_content_maintype() == 'image':
+                    try:
+                        img_data = part.get_payload(decode=True)
+                        description = self._describe_image(img_data)
+                        if description:
+                            image_descriptions.append(description)
+                    except Exception as e:
+                        print(f"Failed to process image: {e}")
+
+        if image_descriptions:
+            self.speak(f"Found {len(image_descriptions)} images:")
+            for i, desc in enumerate(image_descriptions, 1):
+                self.speak(f"Image {i}: {desc}")
         else:
-            return msg.get_payload(decode=True).decode("utf-8")
+            self.speak("No images found in this email.")
 
-    def extract_number(self, command):
-        match = re.search(r"(\d+)", command)
-        if match:
-            return int(match.group(1))
-        for word in command.split():
-            if word in self.number_words:
-                return self.number_words[word]
-        return None
+    def _handle_email_search(self, initial_query=None):
+        """Fixed search workflow"""
+        query = initial_query
+        if not query:
+            self.speak("What would you like to search for?")
+            query = self.listen_command()
+            if not query:
+                self.speak("Search cancelled.")
+                return
 
-    # --- Main Loop ---
+        results = self.search_emails(query)
+        if not results:
+            self.speak(f"No emails found matching '{query}'.")
+            return
+
+        self.speak(f"Found {len(results)} results:")
+        for idx, msg in results:
+            self.speak(f"Email {idx}: {msg['subject']}")
+
+        # Stay in search context
+        while True:
+            self.speak("Say 'open X' to read, or 'back' to return.")
+            cmd = self.listen_command()
+
+            if not cmd:
+                continue
+            if "back" in cmd.lower():
+                break
+
+            num = self.extract_number(cmd)
+            if num in dict(results):
+                self.speak(self._get_email_body(dict(results)[num][1]))
+            else:
+                self.speak("Invalid selection. Try again.")
+
     def run(self):
         self.speak("Welcome to your voice-controlled email assistant.")
         while True:
-            self.speak("Say 'check email', 'search emails', or 'exit'.")
+            self.speak("Say 'check email', 'search', or 'exit'.")
             command = self.listen_command()
 
-            if command == "check email":
+            if not command:
+                continue
+            elif "check" in command or "email" in command:
                 self._handle_email_checking()
-            elif command.startswith("search"):
-                query = command.replace("search", "").strip()
-                self._handle_email_search(query)
-            elif command == "exit":
+            elif "search" in command:
+                self._handle_email_search(command.replace("search", "").strip())
+            elif "exit" in command or "quit" in command:
                 self.speak("Goodbye!")
                 break
 
-    def _handle_email_checking(self):
-        emails = self.fetch_emails()
-        if emails:
-            for idx, (email_id, msg) in emails.items():
-                sender = msg["from"]
-                subject = msg["subject"]
-                priority_flag = " (Priority)" if self.is_priority(msg) else ""
-                spam_flag = " (Spam)" if self.is_spam(subject + " " + self._get_email_body(msg)) else ""
 
-                self.speak(f"Email {idx}: From {sender}. Subject: {subject}{priority_flag}{spam_flag}")
-
-            self.speak("Say 'open X' to read an email, or 'summarize X'.")
-            while True:
-                cmd = self.listen_command()
-                if cmd and ("open" in cmd or "summarize" in cmd):
-                    num = self.extract_number(cmd)
-                    if num in emails:
-                        if "summarize" in cmd:
-                            summary = self.summarize_email(emails[num][1])
-                            self.speak(f"Summary: {summary}")
-                        else:
-                            self.speak(self._get_email_body(emails[num][1]))
-                    break
-
-    def _handle_email_search(self, query):
-        results = self.search_emails(query)
-        if not results:
-            self.speak("No emails found.")
-        else:
-            self.speak(f"Found {len(results)} emails:")
-            for idx, msg in results:
-                self.speak(f"Email {idx}: {msg['subject']}")
-
-
-# Run the Assistant
 if __name__ == "__main__":
     assistant = VoiceEmailManager()
     assistant.run()
