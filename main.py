@@ -125,10 +125,10 @@ class VoiceEmailManager:
             print(f"Image processing failed: {e}")
             return None
 
-    def _get_email_body(self, msg, include_image_descriptions=False):
+    def _get_email_body(self, msg, include_image_descriptions=True):  # Changed default to True
         """
-        Enhanced version that maintains original functionality
-        but can optionally describe images
+        Enhanced version that now automatically describes images by default
+        while maintaining backward compatibility
         """
         text_body = ""
         image_descriptions = []
@@ -136,11 +136,11 @@ class VoiceEmailManager:
         try:
             if msg.is_multipart():
                 for part in msg.walk():
-                    # Get text content (original functionality)
+                    # Get text content
                     if part.get_content_type() == "text/plain":
                         text_body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
 
-                    # New: Analyze images if requested
+                    # Auto-detect images when enabled
                     if include_image_descriptions and part.get_content_maintype() == 'image':
                         img_data = part.get_payload(decode=True)
                         description = self._describe_image(img_data)
@@ -154,10 +154,13 @@ class VoiceEmailManager:
             print(f"Email parsing error: {e}")
             text_body = "Could not read email body"
 
-        # Maintain backward compatibility
+        # Return format depends on whether image descriptions are requested
         if include_image_descriptions:
-            return text_body, image_descriptions
-        return text_body
+            return {
+                'text': text_body,
+                'images': image_descriptions if image_descriptions else None
+            }
+        return text_body  # Backward compatible return
 
     def _get_email_images(self, msg):
         """Extract all images from email"""
@@ -233,10 +236,13 @@ class VoiceEmailManager:
     def is_priority(self, email_msg):
         subject = email_msg.get("subject", "").lower()
         sender = email_msg.get("from", "").lower()
-        body = self._get_email_body(email_msg).lower()
 
-        return (any(s in sender for s in self.priority_senders) or
-                any(k in subject or k in body for k in self.priority_keywords))
+        # Get just the text body (no images)
+        body_data = self._get_email_body(email_msg, include_image_descriptions=False)
+        body = body_data.lower() if isinstance(body_data, str) else ""
+
+        return (any(s.lower() in sender for s in self.priority_senders) or
+                any(k.lower() in subject or k.lower() in body for k in self.priority_keywords))
 
     def _chunk_text(self, text, chunk_size=1024):
         """Split long emails into manageable chunks"""
@@ -287,17 +293,22 @@ class VoiceEmailManager:
             self.speak("No new emails found.")
             return
 
+        # List emails with priority/spam flags
         for idx, (email_id, msg) in self.current_emails.items():
             flags = []
             if self.is_priority(msg):
                 flags.append("Priority")
-            if self.is_spam(f"{msg['subject']} {self._get_email_body(msg)}"):
+
+            # Use text-only version for spam detection
+            text_only_body = self._get_email_body(msg, include_image_descriptions=False)
+            if self.is_spam(f"{msg['subject']} {text_only_body}"):
                 flags.append("Spam")
 
             status = f" ({' | '.join(flags)})" if flags else ""
             self.speak(f"Email {idx}: From {msg['from']}. Subject: {msg['subject']}{status}")
 
-        self.speak("Say 'open X' to read, 'describe X' for images, or 'summarize X' for a summary.")
+        self.speak("Say 'open X' to read, 'describe X' for images only, or 'summarize X' for summary.")
+
         while True:
             cmd = self.listen_command()
             if not cmd:
@@ -308,13 +319,33 @@ class VoiceEmailManager:
 
             num = self.extract_number(cmd)
             if num in self.current_emails:
+                msg = self.current_emails[num][1]
+
                 if "summarise" in cmd.lower() or "summarize" in cmd.lower():
-                    summary = self.summarize_email(self.current_emails[num][1])
+                    # Use text-only version for summarization
+                    text_body = self._get_email_body(msg, include_image_descriptions=False)
+                    summary = self.summarize_email(msg)
                     self.speak(f"Summary: {summary}")
+
                 elif "describe" in cmd.lower():
-                    self._describe_email_images(self.current_emails[num][1])
+                    # Image-only mode
+                    result = self._get_email_body(msg, include_image_descriptions=True)
+                    if result.get('images'):
+                        self.speak("Found images:")
+                        for i, desc in enumerate(result['images'], 1):
+                            self.speak(f"Image {i}: {desc}")
+                    else:
+                        self.speak("No images found in this email.")
+
                 else:
-                    self.speak(self._get_email_body(self.current_emails[num][1]))
+                    # Default reading mode
+                    result = self._get_email_body(msg, include_image_descriptions=True)
+                    if result.get('images'):
+                        self.speak("This email contains images:")
+                        for i, desc in enumerate(result['images'], 1):
+                            self.speak(f"Image {i}: {desc}")
+
+                    self.speak("Email content: " + result['text'][:300])
             else:
                 self.speak("Invalid selection. Try again.")
 
