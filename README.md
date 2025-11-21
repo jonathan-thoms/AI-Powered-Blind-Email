@@ -8,11 +8,11 @@ A specialized desktop application designed to make email accessible for the visu
 
 ## 🚀 Features
 
--   ** Voice Control:** Navigate the inbox, read, and search emails completely hands-free.
--   ** AI Summarization:** Uses `facebook/bart-large-cnn` to condense long corporate emails into brief summaries.
--   ** Image Captioning:** Automatically detects images in emails and describes them using the Salesforce `BLIP` model (e.g., *"A photo of a group of people in a meeting room"*).
--   ** Spam & Priority Filter:** Uses a Naive Bayes classifier to flag spam and highlight urgent emails.
--   ** Interactive GUI:** A clean PyQt5 dashboard to monitor backend processes and logs.
+-   **Voice Control:** Navigate the inbox, read, and search emails completely hands-free.
+-   **AI Summarization:** Uses `facebook/bart-large-cnn` to condense long corporate emails into brief summaries.
+-   **Image Captioning:** Automatically detects images in emails and describes them using the Salesforce `BLIP` model (e.g., *"A photo of a group of people in a meeting room"*).
+-   **Spam & Priority Filter:** Uses a Naive Bayes classifier to flag spam and highlight urgent emails.
+-   **Interactive GUI:** A clean PyQt5 dashboard to monitor backend processes and logs.
 
 ## 🛠️ Tech Stack
 
