@@ -1,0 +1,11 @@
+PyQt5
+SpeechRecognition
+pyttsx3
+python-dotenv
+scikit-learn
+transformers
+torch
+pillow
+imaplib2
+requests
+numpy
